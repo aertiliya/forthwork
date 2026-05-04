@@ -343,7 +343,7 @@ def compute_class_weights(labels):
 def train_model(model, train_loader, val_loader, model_name='model', class_weights=None, seed=42):
     set_seed(seed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10, verbose=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
     mse_loss = nn.MSELoss()
     cw = torch.FloatTensor(class_weights).to(cfg.DEVICE) if class_weights else None
     focal = FocalLoss(alpha=cw, gamma=2.0, label_smoothing=cfg.LABEL_SMOOTHING)
