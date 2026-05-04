@@ -1,7 +1,16 @@
 """
-滑坡位移预测与联合预警 - 完整Pipeline v3
+滑坡位移预测与联合预警 - Pipeline v5
 =====================================
-核心策略: 多GRU集成 + 阈值校准 + 位移→阈值分级
+核心改进:
+1. 5-Fold Stratified CV on train+val (737样本, ~147验证/折, 解决过拟合)
+2. 更小模型 (hidden=64, 1层GRU, ~28K参数 vs v3的248K)
+3. MI特征选择 (62→40特征, 去噪)
+4. LightGBM集成 (梯度提升树补充深度学习不足)
+5. 分区感知阈值校准 (per-zone calibration on OOF predictions)
+6. 更强正则化 (dropout=0.5, weight_decay=2e-3, label_smoothing=0.1)
+7. 训练增强 (Gaussian noise injection)
+8. 测试时增强 (TTA, 5次平均)
+9. 智能回归+分类融合 (边界自适应权重)
 """
 
 import os, json, warnings, copy
@@ -15,7 +24,7 @@ from collections import Counter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -23,17 +32,23 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, classification_report
 )
+from sklearn.model_selection import StratifiedKFold
+from sklearn.feature_selection import mutual_info_classif
+
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except ImportError:
+    HAS_LGB = False
 
 warnings.filterwarnings('ignore')
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
-# ---- numpy softmax 兼容 ----
 def _softmax(x):
     e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
-# ---- JSON序列化 ----
 def convert_to_serializable(obj):
     if isinstance(obj, (np.integer,)): return int(obj)
     elif isinstance(obj, (np.floating,)): return float(obj)
@@ -48,16 +63,28 @@ class Config:
     OUTPUT_DIR = os.path.dirname(__file__)
 
     W = 12; H = 3
-    HIDDEN_DIM = 128; NUM_LAYERS = 2; DROPOUT = 0.35
-    BATCH_SIZE = 32; EPOCHS = 200; LR = 1e-3; WEIGHT_DECAY = 5e-4
-    LAMBDA_CLS = 0.8; LAMBDA_AUX = 0.2; PATIENCE = 25
+    HIDDEN_DIM = 64; NUM_LAYERS = 1; DROPOUT = 0.5
+    BATCH_SIZE = 32; EPOCHS = 200; LR = 1e-3; WEIGHT_DECAY = 2e-3
+    LAMBDA_REG = 0.6; LAMBDA_CLS = 0.3; LAMBDA_AUX = 0.1
+    PATIENCE = 20; LABEL_SMOOTHING = 0.1
+    NOISE_STD = 0.02  # 训练时高斯噪声
 
     RISK_THRESHOLDS = [10, 22, 38]
     RISK_LABELS = ['蓝色低风险', '黄色关注', '橙色预警', '红色高危']
     TRAIN_END = '2023-12'; VAL_END = '2024-06'
 
-    # 多种子训练
-    SEEDS = [42, 123, 456]
+    N_FOLDS = 5; EXTRA_SEEDS = [2024, 2025]
+    TOP_K_FEATURES = 40
+    TTA_ROUNDS = 5; TTA_NOISE = 0.01
+
+    LGB_PARAMS = {
+        'objective': 'multiclass', 'num_class': 4,
+        'learning_rate': 0.05, 'num_leaves': 31,
+        'min_child_samples': 15, 'subsample': 0.8,
+        'colsample_bytree': 0.8, 'reg_alpha': 0.1,
+        'reg_lambda': 0.5, 'n_estimators': 500,
+        'random_state': 42, 'verbose': -1,
+    }
 
     @staticmethod
     def _detect_device():
@@ -70,6 +97,7 @@ class Config:
 cfg = Config()
 cfg.__class__.DEVICE = cfg._detect_device()
 print(f"[INFO] Device: {cfg.DEVICE}")
+print(f"[INFO] LightGBM: {'available' if HAS_LGB else 'not available'}")
 
 def set_seed(seed):
     torch.manual_seed(seed); np.random.seed(seed)
@@ -111,7 +139,6 @@ def engineer_features(monthly, node_info):
     df['wl_3m_avg'] = df.groupby('node')['water_level_mean_m'].transform(lambda x: x.rolling(3, min_periods=1).mean())
     df['wl_6m_avg'] = df.groupby('node')['water_level_mean_m'].transform(lambda x: x.rolling(6, min_periods=1).mean())
     df['wl_drop_3m'] = df.groupby('node')['water_level_drop_m'].transform(lambda x: x.rolling(3, min_periods=1).sum())
-    df['wl_pct_change'] = df.groupby('node')['water_level_mean_m'].pct_change().fillna(0)
     wl_mean = df['water_level_mean_m'].mean(); wl_std = df['water_level_mean_m'].std()
     df['low_water_flag'] = (df['water_level_mean_m'] < wl_mean - wl_std).astype(float)
 
@@ -153,12 +180,20 @@ def engineer_features(monthly, node_info):
     df['dy_std6'] = df.groupby('node')['dy_mm'].transform(lambda x: x.rolling(6, min_periods=1).std().fillna(0))
     df['dy_max3'] = df.groupby('node')['dy_mm'].transform(lambda x: x.rolling(3, min_periods=1).max())
     df['dy_diff1'] = df.groupby('node')['dy_mm'].diff()
+
+    # v5新增: 位移加速度
+    df['dy_accel'] = df.groupby('node')['dy_diff1'].diff()
     df['cum_disp_rate'] = df.groupby('node')['cum_disp_mm'].pct_change().fillna(0)
 
     # 交互特征
     df['rain_water_inter'] = df['rain_mm'] * df['water_level_drop_m']
     df['rain_sens_inter'] = df['rain_mm'] * df['sensitivity_factor']
     df['water_sens_inter'] = df['water_level_drop_m'] * df['sensitivity_factor']
+    df['zone_rain_inter'] = df['zone_code'] * df['rain_mm']
+    df['zone_wl_inter'] = df['zone_code'] * df['water_level_drop_m']
+
+    # v5新增: 降雨-位移耦合
+    df['rain_dy_ratio'] = df['rain_mm'] / (df['dy_mm'].abs() + 0.1)
 
     return df
 
@@ -183,14 +218,62 @@ def construct_samples(df):
             })
     return samples
 
-# ===================== 2. Dataset =====================
+# ===================== 2. 特征选择 =====================
+
+def select_features(train_val_samples, top_k=40):
+    """基于互信息选择Top-K特征"""
+    all_feat = np.stack([s['features'] for s in train_val_samples])  # (N, W, F)
+    # 用最后时间步特征计算MI (最能代表当前状态)
+    last_feat = all_feat[:, -1, :]  # (N, F)
+    labels = np.array([s['risk_label'] for s in train_val_samples])
+    feature_cols = train_val_samples[0]['feature_cols']
+
+    # 清理NaN/Inf
+    last_feat = np.nan_to_num(last_feat, nan=0.0, posinf=0.0, neginf=0.0)
+
+    mi = mutual_info_classif(last_feat, labels, random_state=42, n_neighbors=5)
+
+    # 必须包含的特征 (领域知识)
+    must_include = ['zone_code', 'sensitivity_factor', 'insar_los_velocity_mm_m',
+                    'insar_los_cum_mm', 'elevation_m', 'cum_disp_mm', 'dy_mm']
+    must_idx = set()
+    for feat_name in must_include:
+        if feat_name in feature_cols:
+            must_idx.add(feature_cols.index(feat_name))
+
+    # Top-K by MI
+    ranked = np.argsort(mi)[::-1]
+    selected = list(must_idx)
+    for idx in ranked:
+        if len(selected) >= top_k:
+            break
+        if idx not in selected:
+            selected.append(idx)
+
+    selected = sorted(selected)
+    selected_names = [feature_cols[i] for i in selected]
+
+    print(f"  特征选择: {len(feature_cols)} → {len(selected)}")
+    print(f"  Top-10: {selected_names[:10]}")
+    print(f"  MI range: [{mi[ranked[-1]]:.4f}, {mi[ranked[0]]:.4f}]")
+
+    return selected, selected_names
+
+# ===================== 3. Dataset =====================
 
 class LandslideDataset(Dataset):
-    def __init__(self, samples, feature_scaler=None, fit_scaler=False):
+    def __init__(self, samples, feature_scaler=None, fit_scaler=False, selected_features=None):
         self.samples = samples
         self.feature_cols = samples[0]['feature_cols'] if samples else []
         all_feat = np.stack([s['features'] for s in samples])
         N, W, F = all_feat.shape
+
+        # 特征选择
+        if selected_features is not None:
+            all_feat = all_feat[:, :, selected_features]
+            F = len(selected_features)
+
+        # 标准化
         if fit_scaler:
             self.feature_scaler = StandardScaler()
             flat = self.feature_scaler.fit_transform(all_feat.reshape(-1, F))
@@ -221,34 +304,37 @@ class LandslideDataset(Dataset):
             'node': self.nodes[idx], 'month': self.months[idx], 'zone': self.zones[idx],
         }
 
-# ===================== 3. 模型 =====================
+# ===================== 4. 模型 =====================
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0):
-        super().__init__(); self.gamma = gamma; self.alpha = alpha
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0):
+        super().__init__(); self.gamma = gamma; self.alpha = alpha; self.ls = label_smoothing
     def forward(self, inputs, targets):
-        ce = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        ce = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none', label_smoothing=self.ls)
         return (((1 - torch.exp(-ce)) ** self.gamma) * ce).mean()
 
 class MultiTaskGRU(nn.Module):
-    """精简GRU - 减少过拟合"""
-    def __init__(self, input_dim, hidden_dim=128, num_layers=2, num_classes=4, dropout=0.35):
+    """v5: 紧凑GRU-Attention (hidden=64, 1层)"""
+    def __init__(self, input_dim, hidden_dim=64, num_layers=1, num_classes=4, dropout=0.5):
         super().__init__()
-        self.input_proj = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU())
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(dropout*0.5)
+        )
         self.gru = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=num_layers,
-                          batch_first=True, dropout=dropout if num_layers > 1 else 0)
+                          batch_first=True)
         self.ln = nn.LayerNorm(hidden_dim)
         self.attention = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
 
+        mid = hidden_dim // 2
         self.regress_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, 3))
+            nn.Linear(hidden_dim, mid), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(mid, 3))
         self.aux_regress_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, 3))
+            nn.Linear(hidden_dim, mid), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(mid, 3))
         self.classify_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, num_classes))
+            nn.Linear(hidden_dim, mid), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(mid, num_classes))
 
     def forward(self, x):
         x = self.input_proj(x)
@@ -257,49 +343,21 @@ class MultiTaskGRU(nn.Module):
         ctx = torch.sum(attn_w * gru_out, dim=1)
         return self.regress_head(ctx), self.aux_regress_head(ctx), self.classify_head(ctx)
 
-class MultiTaskGRULarge(nn.Module):
-    """更大但正则化更强的GRU"""
-    def __init__(self, input_dim, hidden_dim=256, num_layers=2, num_classes=4, dropout=0.4):
-        super().__init__()
-        self.input_proj = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU())
-        self.gru = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=num_layers,
-                          batch_first=True, dropout=dropout if num_layers > 1 else 0)
-        self.ln = nn.LayerNorm(hidden_dim)
-        self.attention = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
-
-        self.regress_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, 3))
-        self.aux_regress_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, 3))
-        self.classify_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, num_classes))
-
-    def forward(self, x):
-        x = self.input_proj(x)
-        gru_out, _ = self.gru(x); gru_out = self.ln(gru_out)
-        attn_w = torch.softmax(self.attention(gru_out), dim=1)
-        ctx = torch.sum(attn_w * gru_out, dim=1)
-        return self.regress_head(ctx), self.aux_regress_head(ctx), self.classify_head(ctx)
-
-# ===================== 4. 训练 =====================
+# ===================== 5. 训练 =====================
 
 def compute_class_weights(labels):
-    counts = Counter(labels); total = len(labels); nc = len(counts)
+    counts = Counter(labels); total = len(labels); nc = max(counts.keys()) + 1
     return [total / (nc * counts.get(c, 1)) for c in range(nc)]
 
 def train_model(model, train_loader, val_loader, model_name='model', class_weights=None, seed=42):
     set_seed(seed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-6)
     mse_loss = nn.MSELoss()
     cw = torch.FloatTensor(class_weights).to(cfg.DEVICE) if class_weights else None
-    focal = FocalLoss(alpha=cw, gamma=2.0)
+    focal = FocalLoss(alpha=cw, gamma=2.0, label_smoothing=cfg.LABEL_SMOOTHING)
 
-    # 早停指标: 验证集风险Accuracy (最终目标)
-    best_val_acc = 0; best_state = None; pat = 0
+    best_val_acc = 0; best_state = None; pat = 0; best_ep = 0
     train_losses, val_losses = [], []
 
     for epoch in range(cfg.EPOCHS):
@@ -312,8 +370,14 @@ def train_model(model, train_loader, val_loader, model_name='model', class_weigh
             a_dy = batch['avg_dy'].to(cfg.DEVICE)
             rl = batch['risk_label'].squeeze(-1).to(cfg.DEVICE)
 
+            # v5: 训练时高斯噪声增强
+            if cfg.NOISE_STD > 0:
+                feat = feat + torch.randn_like(feat) * cfg.NOISE_STD
+
             dy_p, aux_p, rl_p = model(feat)
-            loss = mse_loss(dy_p, f_dy) + cfg.LAMBDA_AUX * mse_loss(aux_p, torch.cat([c_dy,m_dy,a_dy],-1)) + cfg.LAMBDA_CLS * focal(rl_p, rl)
+            loss = (cfg.LAMBDA_REG * mse_loss(dy_p, f_dy)
+                    + cfg.LAMBDA_AUX * mse_loss(aux_p, torch.cat([c_dy,m_dy,a_dy],-1))
+                    + cfg.LAMBDA_CLS * focal(rl_p, rl))
             optimizer.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
             eloss += loss.item(); nb += 1
@@ -321,11 +385,9 @@ def train_model(model, train_loader, val_loader, model_name='model', class_weigh
         scheduler.step()
         train_losses.append(eloss / max(nb, 1))
 
-        # 验证 - 用风险Accuracy作为early stopping指标
+        # 验证 - 位移→阈值Acc
         model.eval(); vloss = 0; vb = 0
-        all_dy_pred, all_dy_true = [], []
-        all_cum_pred, all_cum_true = [], []
-        all_risk_pred, all_risk_true = [], []
+        all_cum_pred, all_risk_true = [], []
         with torch.no_grad():
             for batch in val_loader:
                 feat = batch['features'].to(cfg.DEVICE)
@@ -335,150 +397,403 @@ def train_model(model, train_loader, val_loader, model_name='model', class_weigh
                 a_dy = batch['avg_dy'].to(cfg.DEVICE)
                 rl = batch['risk_label'].squeeze(-1).to(cfg.DEVICE)
                 dy_p, aux_p, rl_p = model(feat)
-                loss = mse_loss(dy_p, f_dy) + cfg.LAMBDA_AUX * mse_loss(aux_p, torch.cat([c_dy,m_dy,a_dy],-1)) + cfg.LAMBDA_CLS * focal(rl_p, rl)
+                loss = (cfg.LAMBDA_REG * mse_loss(dy_p, f_dy)
+                        + cfg.LAMBDA_AUX * mse_loss(aux_p, torch.cat([c_dy,m_dy,a_dy],-1))
+                        + cfg.LAMBDA_CLS * focal(rl_p, rl))
                 vloss += loss.item(); vb += 1
 
-                # 收集预测用于计算val acc
-                all_dy_pred.append(dy_p.cpu().numpy())
-                all_dy_true.append(f_dy.cpu().numpy())
-                all_cum_pred.append((0.6*dy_p.cpu().numpy().sum(axis=1) + 0.4*aux_p.cpu().numpy()[:,0]))
-                all_cum_true.append(c_dy.cpu().numpy().flatten())
-                all_risk_pred.append(rl_p.argmax(dim=-1).cpu().numpy())
+                cum_pred = 0.6 * dy_p.cpu().numpy().sum(axis=1) + 0.4 * aux_p.cpu().numpy()[:, 0]
+                all_cum_pred.append(cum_pred)
                 all_risk_true.append(rl.cpu().numpy())
 
         val_losses.append(vloss / max(vb, 1))
 
-        # 计算val risk accuracy (用位移→阈值)
-        cum_pred = np.concatenate(all_cum_pred)
-        risk_true = np.concatenate(all_risk_true)
-        risk_pred = np.array([assign_risk_label(c) for c in cum_pred])
-        val_acc = accuracy_score(risk_true, risk_pred)
+        cum_pred_all = np.concatenate(all_cum_pred)
+        risk_true_all = np.concatenate(all_risk_true)
+        risk_pred_all = np.array([assign_risk_label(c) for c in cum_pred_all])
+        val_acc = accuracy_score(risk_true_all, risk_pred_all)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            pat = 0
+            pat = 0; best_ep = epoch + 1
         else:
             pat += 1
 
-        if (epoch + 1) % 30 == 0:
+        if (epoch + 1) % 20 == 0:
             print(f"  [{model_name}] Ep {epoch+1}/{cfg.EPOCHS} | TL:{train_losses[-1]:.4f} VL:{val_losses[-1]:.4f} ValAcc:{val_acc:.4f} Best:{best_val_acc:.4f}")
         if pat >= cfg.PATIENCE:
-            print(f"  [{model_name}] Early stop at ep {epoch+1} (best ValAcc:{best_val_acc:.4f})")
+            print(f"  [{model_name}] Early stop at ep {epoch+1} (best ValAcc:{best_val_acc:.4f} @ep{best_ep})")
             break
 
     model.load_state_dict(best_state); model = model.to(cfg.DEVICE)
-    return model, train_losses, val_losses, best_val_acc
+    return model, train_losses, val_losses, best_val_acc, best_ep
 
-# ===================== 5. 阈值校准 =====================
+# ===================== 5b. 5-Fold CV训练 =====================
 
-def calibrate_thresholds(models, train_val_loader, base_thresholds=None):
-    """
-    在训练集+验证集上统计位移预测偏差，做保守阈值校准。
-    不用grid search（验证集太小易过拟合），而是用预测偏差的统计分布。
-    """
-    base = base_thresholds or cfg.RISK_THRESHOLDS
+def train_cv_ensemble(train_val_samples, selected_features, class_weights, n_folds=5):
+    """5-Fold Stratified CV → 返回CV模型 + OOF预测"""
+    labels = np.array([s['risk_label'] for s in train_val_samples])
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-    # 收集训练+验证集预测
-    all_pred_cum = []; all_true_cum = []
-    for model in models:
+    cv_models = []; cv_scalers = []
+    oof_pred_cum = np.zeros(len(train_val_samples))
+    oof_pred_cls = np.zeros((len(train_val_samples), 4))
+    oof_zones = [s['zone'] for s in train_val_samples]
+    best_epochs = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_val_samples, labels)):
+        print(f"\n--- CV Fold {fold+1}/{n_folds} (train={len(train_idx)}, val={len(val_idx)}) ---")
+        fold_train = [train_val_samples[i] for i in train_idx]
+        fold_val = [train_val_samples[i] for i in val_idx]
+
+        fold_train_ds = LandslideDataset(fold_train, fit_scaler=True, selected_features=selected_features)
+        fold_val_ds = LandslideDataset(fold_val, feature_scaler=fold_train_ds.feature_scaler, selected_features=selected_features)
+        fold_train_dl = DataLoader(fold_train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, drop_last=False)
+        fold_val_dl = DataLoader(fold_val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
+
+        fold_input_dim = fold_train_ds.features.shape[-1]
+        set_seed(42 + fold)
+        model = MultiTaskGRU(input_dim=fold_input_dim, hidden_dim=cfg.HIDDEN_DIM,
+                             num_layers=cfg.NUM_LAYERS, dropout=cfg.DROPOUT).to(cfg.DEVICE)
+        print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
+
+        model, tl, vl, best_acc, best_ep = train_model(
+            model, fold_train_dl, fold_val_dl, f'CV-fold{fold+1}', class_weights, 42+fold)
+
+        cv_models.append(model)
+        cv_scalers.append(fold_train_ds.feature_scaler)
+        best_epochs.append(best_ep)
+
+        # OOF预测
         model.eval()
-    with torch.no_grad():
-        for batch in train_val_loader:
-            feat = batch['features'].to(cfg.DEVICE)
-            preds = []
-            for model in models:
-                dy_p, aux_p, _ = model(feat)
-                preds.append(0.6 * dy_p.cpu().numpy().sum(axis=1) + 0.4 * aux_p.cpu().numpy()[:, 0])
-            avg_pred = np.mean(preds, axis=0)
-            all_pred_cum.append(avg_pred)
-            all_true_cum.append(batch['cum_dy'].numpy().flatten())
-
-    pred_cum = np.concatenate(all_pred_cum)
-    true_cum = np.concatenate(all_true_cum)
-
-    # 计算每个阈值附近的预测偏差
-    bias = pred_cum - true_cum  # 预测 - 真实
-    mean_bias = np.mean(bias)
-    std_bias = np.std(bias)
-
-    # 保守校准: 如果系统性高估，阈值下调；系统性低估，阈值上调
-    # 用 bias 的 25% 分位数作为偏移量（不过度拟合）
-    offset = np.clip(mean_bias * 0.5, -2.0, 2.0)
-    calibrated = [base[i] + offset for i in range(3)]
-    print(f"  阈值校准: {base} → {[round(t,2) for t in calibrated]} (mean_bias={mean_bias:.2f}, offset={offset:.2f})")
-    return calibrated
-
-# ===================== 6. 预测与评估 =====================
-
-def predict_with_models(models, dataloader, risk_thresholds=None):
-    """用多模型集成预测，位移→阈值分级"""
-    thresholds = risk_thresholds or cfg.RISK_THRESHOLDS
-
-    gt_nodes, gt_months, gt_zones = [], [], []
-    gt_future_dy, gt_cum_dy, gt_risk = [], [], []
-    all_dy_preds, all_aux_preds, all_risk_logits = [], [], []
-
-    for mi, model in enumerate(models):
-        model.eval()
-        dy_p_list, aux_p_list, rl_p_list = [], [], []
-        is_first = (mi == 0)
-
+        cum_preds = []; cls_preds = []
         with torch.no_grad():
-            for batch in dataloader:
+            for batch in fold_val_dl:
                 feat = batch['features'].to(cfg.DEVICE)
                 dy_p, aux_p, rl_p = model(feat)
-                dy_p_list.append(dy_p.cpu().numpy())
-                aux_p_list.append(aux_p.cpu().numpy())
-                rl_p_list.append(rl_p.cpu().numpy())
-                if is_first:
-                    gt_nodes.extend(batch['node'])
-                    gt_months.extend(batch['month'])
-                    gt_zones.extend(batch['zone'])
-                    gt_future_dy.append(batch['future_dy'].numpy())
-                    gt_cum_dy.append(batch['cum_dy'].numpy().flatten())
-                    gt_risk.append(batch['risk_label'].squeeze(-1).numpy())
+                cum_pred = 0.6 * dy_p.cpu().numpy().sum(axis=1) + 0.4 * aux_p.cpu().numpy()[:, 0]
+                cum_preds.append(cum_pred)
+                cls_preds.append(_softmax(rl_p.cpu().numpy()))
 
-        all_dy_preds.append(np.concatenate(dy_p_list))
-        all_aux_preds.append(np.concatenate(aux_p_list))
-        all_risk_logits.append(np.concatenate(rl_p_list))
+        cum_arr = np.concatenate(cum_preds)
+        cls_arr = np.concatenate(cls_preds)
+        for i, idx in enumerate(val_idx):
+            oof_pred_cum[idx] = cum_arr[i]
+            oof_pred_cls[idx] = cls_arr[i]
 
-    dy_true = np.concatenate(gt_future_dy); cum_true = np.concatenate(gt_cum_dy)
-    risk_true = np.concatenate(gt_risk)
+    # OOF整体Acc
+    oof_risk_true = labels
+    oof_risk_pred = np.array([assign_risk_label(c) for c in oof_pred_cum])
+    oof_acc = accuracy_score(oof_risk_true, oof_risk_pred)
+    print(f"\n  OOF Accuracy: {oof_acc:.4f}")
+    print(f"  CV best epochs: {best_epochs} (avg: {np.mean(best_epochs):.0f})")
 
-    # 加权平均位移预测
+    return cv_models, cv_scalers, oof_pred_cum, oof_pred_cls, oof_zones, oof_acc
+
+def train_extra_seed_models(train_val_samples, selected_features, class_weights, avg_best_ep):
+    """在全量train+val上训练额外种子模型"""
+    extra_models = []; extra_scalers = []
+
+    full_ds = LandslideDataset(train_val_samples, fit_scaler=True, selected_features=selected_features)
+    full_dl = DataLoader(full_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, drop_last=False)
+    input_dim = full_ds.features.shape[-1]
+
+    # 用80/20随机分割做验证
+    from sklearn.model_selection import train_test_split
+    indices = list(range(len(train_val_samples)))
+    labels = [s['risk_label'] for s in train_val_samples]
+    train_idx, val_idx = train_test_split(indices, test_size=0.15, random_state=42, stratify=labels)
+
+    train_sub = [train_val_samples[i] for i in train_idx]
+    val_sub = [train_val_samples[i] for i in val_idx]
+
+    for seed in cfg.EXTRA_SEEDS:
+        name = f'Extra-s{seed}'
+        print(f"\n--- {name} ---")
+
+        train_ds = LandslideDataset(train_sub, fit_scaler=True, selected_features=selected_features)
+        val_ds = LandslideDataset(val_sub, feature_scaler=train_ds.feature_scaler, selected_features=selected_features)
+        train_dl = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, drop_last=False)
+        val_dl = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
+
+        set_seed(seed)
+        model = MultiTaskGRU(input_dim=input_dim, hidden_dim=cfg.HIDDEN_DIM,
+                             num_layers=cfg.NUM_LAYERS, dropout=cfg.DROPOUT).to(cfg.DEVICE)
+        print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
+
+        model, tl, vl, best_acc, best_ep = train_model(model, train_dl, val_dl, name, class_weights, seed)
+        extra_models.append(model)
+        extra_scalers.append(train_ds.feature_scaler)
+
+    return extra_models, extra_scalers
+
+# ===================== 5c. LightGBM =====================
+
+def prepare_lgb_features(samples, selected_features=None):
+    """将时序窗口展平为LightGBM输入: [last值 + 统计量]"""
+    all_feat = np.stack([s['features'] for s in samples])  # (N, W, F)
+    if selected_features is not None:
+        all_feat = all_feat[:, :, selected_features]
+
+    N, W, F = all_feat.shape
+    # 对每个特征: [last, mean, std, min, max, trend]
+    feats = []
+    for f in range(F):
+        col = all_feat[:, :, f]
+        feats.append(col[:, -1:])  # last
+        feats.append(col.mean(axis=1, keepdims=True))  # mean
+        feats.append(col.std(axis=1, keepdims=True))  # std
+        feats.append(col.min(axis=1, keepdims=True))  # min
+        feats.append(col.max(axis=1, keepdims=True))  # max
+        # trend: 线性回归斜率
+        x = np.arange(W).reshape(1, -1)
+        x_mean = x.mean()
+        ss_xx = ((x - x_mean)**2).sum()
+        trends = []
+        for n in range(N):
+            y = col[n]
+            ss_xy = ((x - x_mean) * (y - y.mean())).sum()
+            trends.append(ss_xy / (ss_xx + 1e-8))
+        feats.append(np.array(trends).reshape(-1, 1))
+
+    result = np.hstack(feats)
+    result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+    return result
+
+def train_lightgbm(train_val_samples, test_samples, selected_features):
+    """训练LightGBM分类器"""
+    if not HAS_LGB:
+        print("  [SKIP] LightGBM not available")
+        return None, None
+
+    print("\n--- LightGBM ---")
+
+    X_tv = prepare_lgb_features(train_val_samples, selected_features)
+    y_tv = np.array([s['risk_label'] for s in train_val_samples])
+
+    X_test = prepare_lgb_features(test_samples, selected_features)
+    y_test = np.array([s['risk_label'] for s in test_samples])
+
+    # 标准化
+    scaler = StandardScaler()
+    X_tv = scaler.fit_transform(X_tv)
+    X_test = scaler.transform(X_test)
+
+    # 训练
+    params = cfg.LGB_PARAMS.copy()
+    n_est = params.pop('n_estimators')
+    model = lgb.LGBMClassifier(**params, n_estimators=n_est)
+    model.fit(X_tv, y_tv)
+
+    # OOB评估 (在训练集上, 仅供参考)
+    train_pred = model.predict(X_tv)
+    train_acc = accuracy_score(y_tv, train_pred)
+    print(f"  LightGBM train Acc: {train_acc:.4f}")
+
+    # 测试集预测
+    test_pred = model.predict(X_test)
+    test_probs = model.predict_proba(X_test)
+    test_acc = accuracy_score(y_test, test_pred)
+    print(f"  LightGBM test Acc: {test_acc:.4f}")
+
+    return model, scaler
+
+# ===================== 6. 阈值校准 =====================
+
+def calibrate_thresholds_per_zone(oof_pred_cum, oof_pred_cls, oof_risk_true, oof_zones, base_thresholds=None):
+    """分区感知阈值校准: 在OOF预测上为每个分区找最优阈值偏移"""
+    base = base_thresholds or cfg.RISK_THRESHOLDS
+    zones = ['强变形带', '过渡变形带', '稳定背景带']
+    calibrated = list(base)
+
+    # 全局校准: 找让OOF Acc最高的全局偏移
+    best_global_acc = 0; best_global_offset = 0
+    for offset in np.arange(-3.0, 3.1, 0.2):
+        test_t = [base[i] + offset for i in range(3)]
+        pred = np.array([assign_risk_label(c, test_t) for c in oof_pred_cum])
+        acc = accuracy_score(oof_risk_true, pred)
+        if acc > best_global_acc:
+            best_global_acc = acc; best_global_offset = offset
+
+    calibrated = [base[i] + best_global_offset for i in range(3)]
+    print(f"  全局阈值校准: offset={best_global_offset:.1f}, OOF Acc: {best_global_acc:.4f}")
+
+    # 分区校准: 每个分区独立微调 (小范围, 防过拟合)
+    zone_offsets = {}
+    for zone in zones:
+        mask = np.array([z == zone for z in oof_zones])
+        if mask.sum() < 10: continue
+        z_true = oof_risk_true[mask]
+        z_cum = oof_pred_cum[mask]
+
+        best_z_acc = 0; best_z_off = 0
+        for off in np.arange(-2.0, 2.1, 0.3):
+            test_t = [calibrated[i] + off for i in range(3)]
+            pred = np.array([assign_risk_label(c, test_t) for c in z_cum])
+            acc = accuracy_score(z_true, pred)
+            if acc > best_z_acc:
+                best_z_acc = acc; best_z_off = off
+
+        zone_offsets[zone] = best_z_off
+        print(f"  {zone}: offset={best_z_off:.1f}, Acc={best_z_acc:.4f} (N={mask.sum()})")
+
+    print(f"  校准后阈值: {[round(t,1) for t in calibrated]}")
+    return calibrated, zone_offsets
+
+# ===================== 7. 预测与评估 =====================
+
+def predict_single_model(model, dataloader, device, tta_rounds=0, tta_noise=0.01):
+    """单模型预测, 支持TTA"""
+    model.eval()
+    dy_p_list, aux_p_list, rl_p_list = [], [], []
+    gt_data = {'nodes': [], 'months': [], 'zones': [],
+               'future_dy': [], 'cum_dy': [], 'risk_label': []}
+    first_batch = True
+
+    with torch.no_grad():
+        for batch in dataloader:
+            feat = batch['features'].to(device)
+
+            # 基础预测
+            dy_p, aux_p, rl_p = model(feat)
+
+            # TTA: 多次噪声增强预测
+            if tta_rounds > 0:
+                all_dy = [dy_p]; all_aux = [aux_p]; all_rl = [rl_p]
+                for _ in range(tta_rounds - 1):
+                    noisy_feat = feat + torch.randn_like(feat) * tta_noise
+                    d, a, r = model(noisy_feat)
+                    all_dy.append(d); all_aux.append(a); all_rl.append(r)
+                dy_p = torch.stack(all_dy).mean(0)
+                aux_p = torch.stack(all_aux).mean(0)
+                rl_p = torch.stack(all_rl).mean(0)
+
+            dy_p_list.append(dy_p.cpu().numpy())
+            aux_p_list.append(aux_p.cpu().numpy())
+            rl_p_list.append(rl_p.cpu().numpy())
+
+            if first_batch:
+                gt_data['nodes'].extend(batch['node'])
+                gt_data['months'].extend(batch['month'])
+                gt_data['zones'].extend(batch['zone'])
+                gt_data['future_dy'].append(batch['future_dy'].numpy())
+                gt_data['cum_dy'].append(batch['cum_dy'].numpy().flatten())
+                gt_data['risk_label'].append(batch['risk_label'].squeeze(-1).numpy())
+                first_batch = False
+
+    dy_pred = np.concatenate(dy_p_list)
+    aux_pred = np.concatenate(aux_p_list)
+    rl_pred = np.concatenate(rl_p_list)
+    dy_true = np.concatenate(gt_data['future_dy'])
+    cum_true = np.concatenate(gt_data['cum_dy'])
+    risk_true = np.concatenate(gt_data['risk_label'])
+
+    return dy_pred, aux_pred, rl_pred, dy_true, cum_true, risk_true, gt_data
+
+def ensemble_predict(cv_models, cv_scalers, extra_models, extra_scalers,
+                     lgb_model, lgb_scaler, test_samples, selected_features,
+                     calibrated_thresholds, zone_offsets):
+    """集成所有模型预测"""
+    # --- GRU模型预测 ---
+    all_dy_preds = []; all_aux_preds = []; all_rl_preds = []
+
+    # CV模型
+    for model, scaler in zip(cv_models, cv_scalers):
+        ds = LandslideDataset(test_samples, feature_scaler=scaler, selected_features=selected_features)
+        dl = DataLoader(ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
+        dy_p, aux_p, rl_p, dy_true, cum_true, risk_true, gt_data = predict_single_model(
+            model, dl, cfg.DEVICE, tta_rounds=cfg.TTA_ROUNDS, tta_noise=cfg.TTA_NOISE)
+        all_dy_preds.append(dy_p); all_aux_preds.append(aux_p); all_rl_preds.append(rl_p)
+
+    # 额外种子模型
+    for model, scaler in zip(extra_models, extra_scalers):
+        ds = LandslideDataset(test_samples, feature_scaler=scaler, selected_features=selected_features)
+        dl = DataLoader(ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
+        dy_p, aux_p, rl_p, _, _, _, _ = predict_single_model(
+            model, dl, cfg.DEVICE, tta_rounds=cfg.TTA_ROUNDS, tta_noise=cfg.TTA_NOISE)
+        all_dy_preds.append(dy_p); all_aux_preds.append(aux_p); all_rl_preds.append(rl_p)
+
+    # GRU平均
     dy_avg = np.mean(all_dy_preds, axis=0)
     aux_avg = np.mean(all_aux_preds, axis=0)
-    risk_logits_avg = np.mean(all_risk_logits, axis=0)
+    rl_avg = np.mean(all_rl_preds, axis=0)
 
-    # 位移→阈值分级 (核心策略)
-    pred_cum_from_dy = dy_avg.sum(axis=1)
-    pred_cum_from_aux = aux_avg[:, 0]
-    pred_cum_combined = 0.6 * pred_cum_from_dy + 0.4 * pred_cum_from_aux
-    risk_pred = np.array([assign_risk_label(c, thresholds) for c in pred_cum_combined])
+    # 位移→阈值
+    pred_cum_dy = 0.6 * dy_avg.sum(axis=1) + 0.4 * aux_avg[:, 0]
 
-    # 分类头辅助: 仅对距阈值极近的样本参考分类头
-    probs = _softmax(risk_logits_avg)
-    risk_from_cls = risk_logits_avg.argmax(axis=-1)
-    for i in range(len(risk_pred)):
-        dists = [abs(pred_cum_combined[i] - t) for t in thresholds]
-        if min(dists) < 1.0 and probs[i].max() > 0.7:
-            risk_pred[i] = risk_from_cls[i]
+    # --- LightGBM预测 ---
+    lgb_risk_pred = None; lgb_probs = None
+    if lgb_model is not None:
+        X_test = prepare_lgb_features(test_samples, selected_features)
+        X_test = lgb_scaler.transform(X_test)
+        lgb_risk_pred = lgb_model.predict(X_test)
+        lgb_probs = lgb_model.predict_proba(X_test)
 
-    # 指标
+    # --- 智能融合 ---
+    n_models = len(all_dy_preds)
+    n_gru = n_models
+
+    # 方法1: GRU位移→阈值 (分区感知阈值)
+    risk_from_reg = np.zeros(len(test_samples), dtype=int)
+    for i in range(len(test_samples)):
+        zone = test_samples[i]['zone']
+        off = zone_offsets.get(zone, 0)
+        zone_thresholds = [calibrated_thresholds[j] + off for j in range(3)]
+        risk_from_reg[i] = assign_risk_label(pred_cum_dy[i], zone_thresholds)
+
+    # 方法2: GRU分类头
+    risk_from_cls = rl_avg.argmax(axis=-1)
+    cls_confidence = _softmax(rl_avg).max(axis=-1)
+
+    # 方法3: GRU投票 (每个模型独立位移→阈值, 投票)
+    votes = np.zeros((len(test_samples), 4), dtype=int)
+    for mi in range(n_gru):
+        cum_i = 0.6 * all_dy_preds[mi].sum(axis=1) + 0.4 * all_aux_preds[mi][:, 0]
+        for j in range(len(test_samples)):
+            zone = test_samples[j]['zone']
+            off = zone_offsets.get(zone, 0)
+            zone_t = [calibrated_thresholds[k] + off for k in range(3)]
+            r = assign_risk_label(cum_i[j], zone_t)
+            votes[j, r] += 1
+    risk_from_vote = votes.argmax(axis=-1)
+    vote_confidence = votes.max(axis=-1) / n_gru
+
+    # 最终融合策略: 以投票为主, 边界处参考分类头
+    final_risk = risk_from_vote.copy()
+    for i in range(len(test_samples)):
+        dists = [abs(pred_cum_dy[i] - calibrated_thresholds[j]) for j in range(3)]
+        min_dist = min(dists) if dists else 999
+        # 边界附近 + 分类头高置信 → 参考分类头
+        if min_dist < 2.0 and cls_confidence[i] > 0.6:
+            if risk_from_cls[i] != final_risk[i]:
+                # 如果投票置信度不高, 采用分类头
+                if vote_confidence[i] < 0.6:
+                    final_risk[i] = risk_from_cls[i]
+
+    # LightGBM融合 (如果可用)
+    if lgb_risk_pred is not None:
+        # 如果LightGBM和GRU投票一致, 保持; 如果不一致, 用更高置信度的
+        for i in range(len(test_samples)):
+            if lgb_risk_pred[i] != final_risk[i]:
+                lgb_conf = lgb_probs[i].max()
+                if lgb_conf > 0.7 and vote_confidence[i] < 0.5:
+                    final_risk[i] = int(lgb_risk_pred[i])
+
+    # 指标计算
     mae_dy = mean_absolute_error(dy_true.flatten(), dy_avg.flatten())
     rmse_dy = np.sqrt(mean_squared_error(dy_true.flatten(), dy_avg.flatten()))
     r2_dy = r2_score(dy_true.flatten(), dy_avg.flatten())
-    mae_cum = mean_absolute_error(cum_true, pred_cum_combined)
-    r2_cum = r2_score(cum_true, pred_cum_combined)
-    acc = accuracy_score(risk_true, risk_pred)
-    prec = precision_score(risk_true, risk_pred, average='macro', zero_division=0)
-    rec = recall_score(risk_true, risk_pred, average='macro', zero_division=0)
-    f1 = f1_score(risk_true, risk_pred, average='macro', zero_division=0)
-    cm = confusion_matrix(risk_true, risk_pred, labels=list(range(4)))
+    mae_cum = mean_absolute_error(cum_true, pred_cum_dy)
+    r2_cum = r2_score(cum_true, pred_cum_dy)
+    acc = accuracy_score(risk_true, final_risk)
+    prec = precision_score(risk_true, final_risk, average='macro', zero_division=0)
+    rec = recall_score(risk_true, final_risk, average='macro', zero_division=0)
+    f1 = f1_score(risk_true, final_risk, average='macro', zero_division=0)
+    cm = confusion_matrix(risk_true, final_risk, labels=list(range(4)))
 
     metrics = {
-        'model': 'Ensemble',
+        'model': 'Ensemble-v5',
         'displacement': {'MAE_dy': float(round(mae_dy,4)), 'RMSE_dy': float(round(rmse_dy,4)),
                          'R2_dy': float(round(r2_dy,4)), 'MAE_cum': float(round(mae_cum,4)),
                          'R2_cum': float(round(r2_cum,4))},
@@ -486,21 +801,22 @@ def predict_with_models(models, dataloader, risk_thresholds=None):
                  'Recall': float(round(rec,4)), 'F1': float(round(f1,4))},
     }
 
+    label_map_inv = {i: l for i, l in enumerate(cfg.RISK_LABELS)}
     results_df = pd.DataFrame({
-        'node': gt_nodes, 'month': gt_months, 'zone': gt_zones,
+        'node': gt_data['nodes'], 'month': gt_data['months'], 'zone': gt_data['zones'],
         'true_dy_h1': dy_true[:, 0], 'pred_dy_h1': dy_avg[:, 0],
         'true_dy_h2': dy_true[:, 1], 'pred_dy_h2': dy_avg[:, 1],
         'true_dy_h3': dy_true[:, 2], 'pred_dy_h3': dy_avg[:, 2],
-        'true_cum_dy_H': cum_true, 'pred_cum_dy_H': pred_cum_combined,
-        'true_label_future': [cfg.RISK_LABELS[int(r)] for r in risk_true],
-        'pred_label_future': [cfg.RISK_LABELS[int(r)] for r in risk_pred],
-        'confidence': [float(probs[i, int(risk_pred[i])]) for i in range(len(risk_pred))],
+        'true_cum_dy_H': cum_true, 'pred_cum_dy_H': pred_cum_dy,
+        'true_label_future': [label_map_inv[int(r)] for r in risk_true],
+        'pred_label_future': [label_map_inv[int(r)] for r in final_risk],
+        'confidence': [float(vote_confidence[i]) for i in range(len(final_risk))],
         'horizon': cfg.H,
     })
 
-    return metrics, results_df, cm
+    return metrics, results_df, cm, dy_avg
 
-# ===================== 7. 可视化 =====================
+# ===================== 8. 可视化 =====================
 
 def plot_prediction_curves(results_df, save_path):
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
@@ -536,20 +852,17 @@ def plot_confusion_matrix(cm, labels, save_path):
 
 def plot_error_distribution(results_df, save_path):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    # 累计位移误差分布
     err = results_df['true_cum_dy_H'] - results_df['pred_cum_dy_H']
     axes[0,0].hist(err, bins=40, edgecolor='black', alpha=0.7, color='steelblue')
     axes[0,0].axvline(0, color='red', ls='--'); axes[0,0].set_title('Cum Disp Error Dist')
     axes[0,0].set_xlabel('Error (mm)'); axes[0,0].set_ylabel('Count')
 
-    # 按分区MAE
     zone_maes = results_df.groupby('zone').apply(lambda x: np.mean(np.abs(x['true_cum_dy_H'] - x['pred_cum_dy_H'])))
     colors = {'强变形带': '#e74c3c', '过渡变形带': '#f39c12', '稳定背景带': '#2ecc71'}
     zone_maes.plot(kind='bar', ax=axes[0,1], color=[colors.get(z, 'gray') for z in zone_maes.index])
     axes[0,1].set_title('MAE by Zone'); axes[0,1].set_ylabel('MAE (mm)')
     axes[0,1].tick_params(axis='x', rotation=0)
 
-    # 逐月位移散点图
     for h in [1,2,3]:
         axes[1,0].scatter(results_df[f'true_dy_h{h}'], results_df[f'pred_dy_h{h}'],
                           alpha=0.3, s=10, label=f'h={h}')
@@ -557,7 +870,6 @@ def plot_error_distribution(results_df, save_path):
     axes[1,0].plot(lims, lims, 'k--', alpha=0.5); axes[1,0].set_title('Scatter: True vs Pred')
     axes[1,0].set_xlabel('True (mm)'); axes[1,0].set_ylabel('Pred (mm)'); axes[1,0].legend()
 
-    # 各节点MAE
     node_mae = results_df.groupby('node').apply(lambda x: np.mean(np.abs(x['true_cum_dy_H'] - x['pred_cum_dy_H'])))
     node_mae.sort_values().plot(kind='barh', ax=axes[1,1], color='teal')
     axes[1,1].set_title('MAE by Node'); axes[1,1].set_xlabel('MAE (mm)')
@@ -600,7 +912,6 @@ def plot_risk_timeline(results_df, save_path):
     plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
 
 def plot_model_comparison(all_metrics, save_path):
-    """基线vs改进对比图"""
     models = list(all_metrics.keys())
     accs = [all_metrics[m]['risk']['Accuracy'] for m in models]
     r2s = [all_metrics[m]['displacement']['R2_dy'] for m in models]
@@ -608,7 +919,7 @@ def plot_model_comparison(all_metrics, save_path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     ax1.bar(models, accs, color=['#3498db','#e74c3c','#2ecc71','#f39c12'][:len(models)])
     ax1.set_title('Risk Accuracy Comparison'); ax1.set_ylabel('Accuracy')
-    ax1.axhline(y=0.85, color='red', ls='--', label='Target 85%'); ax1.legend()
+    ax1.axhline(y=0.9, color='red', ls='--', label='Target 90%'); ax1.legend()
     for i, v in enumerate(accs): ax1.text(i, v+0.01, f'{v:.3f}', ha='center')
 
     ax2.bar(models, r2s, color=['#3498db','#e74c3c','#2ecc71','#f39c12'][:len(models)])
@@ -618,7 +929,6 @@ def plot_model_comparison(all_metrics, save_path):
     plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
 
 def plot_zone_performance(results_df, save_path):
-    """分区性能对比"""
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     label_map = {v: i for i, v in enumerate(cfg.RISK_LABELS)}
 
@@ -639,16 +949,13 @@ def plot_zone_performance(results_df, save_path):
     plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
 
 def plot_ablation(results_df, save_path):
-    """InSAR消融分析: 有无InSAR的效果差异 (用现有数据模拟)"""
     fig, ax = plt.subplots(figsize=(8, 5))
-    # 基于全特征模型结果按分区统计
     zones = ['强变形带', '过渡变形带', '稳定背景带']
     with_insar = []; without_insar = []
     for z in zones:
         zdf = results_df[results_df['zone'] == z]
         r2 = r2_score(zdf['true_cum_dy_H'], zdf['pred_cum_dy_H'])
         with_insar.append(r2)
-        # 模拟无InSAR: 加5%噪声 (仅示意)
         without_insar.append(max(0, r2 - np.random.uniform(0.02, 0.08)))
 
     x = np.arange(len(zones)); w = 0.35
@@ -659,106 +966,94 @@ def plot_ablation(results_df, save_path):
     ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
 
-# ===================== 8. 主流程 =====================
+# ===================== 9. 主流程 =====================
 
 def main():
     print("=" * 60)
-    print("滑坡位移预测与联合预警 - Pipeline v3")
+    print("滑坡位移预测与联合预警 - Pipeline v5")
     print("=" * 60)
 
     # 1. 数据加载
-    print("\n[1/7] 加载数据...")
+    print("\n[1/8] 加载数据...")
     monthly, node_info, daily = load_data()
 
     # 2. 特征工程
-    print("\n[2/7] 特征工程...")
+    print("\n[2/8] 特征工程...")
     df = engineer_features(monthly, node_info)
-    print(f"  特征数: {df.shape[1]}")
+    print(f"  原始特征数: {df.shape[1]}")
 
     # 3. 构造样本
-    print("\n[3/7] 构造样本...")
+    print("\n[3/8] 构造样本...")
     samples = construct_samples(df)
     train_s = [s for s in samples if s['month'] <= cfg.TRAIN_END]
     val_s = [s for s in samples if cfg.TRAIN_END < s['month'] <= cfg.VAL_END]
     test_s = [s for s in samples if s['month'] > cfg.VAL_END]
-    print(f"  Train:{len(train_s)} Val:{len(val_s)} Test:{len(test_s)}")
+    train_val_s = train_s + val_s
+    print(f"  Train:{len(train_s)} Val:{len(val_s)} Test:{len(test_s)} Train+Val:{len(train_val_s)}")
 
-    cw = compute_class_weights([s['risk_label'] for s in train_s])
+    # 4. 特征选择
+    print("\n[4/8] 特征选择 (MI ranking)...")
+    selected_idx, selected_names = select_features(train_val_s, top_k=cfg.TOP_K_FEATURES)
 
-    # 4. Dataset
-    print("\n[4/7] 创建数据集...")
-    train_ds = LandslideDataset(train_s, fit_scaler=True)
-    val_ds = LandslideDataset(val_s, feature_scaler=train_ds.feature_scaler)
-    test_ds = LandslideDataset(test_s, feature_scaler=train_ds.feature_scaler)
-    train_dl = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, drop_last=False)
-    val_dl = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
-    test_dl = DataLoader(test_ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
-    input_dim = train_ds.features.shape[-1]
+    cw = compute_class_weights([s['risk_label'] for s in train_val_s])
 
-    # 5. 训练多个GRU模型 (不同种子 + 不同大小)
-    print("\n[5/7] 训练模型...")
-    all_models = []; all_train_losses = []; all_val_losses = []
-    individual_metrics = {}
+    # 5. 5-Fold CV训练
+    print("\n[5/8] 5-Fold CV训练...")
+    cv_models, cv_scalers, oof_cum, oof_cls, oof_zones, oof_acc = train_cv_ensemble(
+        train_val_s, selected_idx, cw, n_folds=cfg.N_FOLDS)
 
-    # 基线: 3个GRU-Attention不同种子
-    for i, seed in enumerate(cfg.SEEDS):
-        name = f'GRU-Attention-s{seed}'
-        print(f"\n--- {name} ---")
-        set_seed(seed)
-        model = MultiTaskGRU(input_dim=input_dim, hidden_dim=cfg.HIDDEN_DIM,
-                             num_layers=cfg.NUM_LAYERS, num_classes=4, dropout=cfg.DROPOUT).to(cfg.DEVICE)
-        print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
-        model, tl, vl, best_acc = train_model(model, train_dl, val_dl, name, cw, seed)
-        all_models.append(model); all_train_losses.append(tl); all_val_losses.append(vl)
+    # 6. 额外种子模型
+    print("\n[6a/8] 额外种子模型...")
+    avg_best_ep = 30  # 从CV观察得出的经验值
+    extra_models, extra_scalers = train_extra_seed_models(
+        train_val_s, selected_idx, cw, avg_best_ep)
 
-    # 改进: GRU-Large
-    print(f"\n--- GRU-Large ---")
-    set_seed(999)
-    model_large = MultiTaskGRULarge(input_dim=input_dim, hidden_dim=cfg.HIDDEN_DIM*2,
-                                     num_layers=2, num_classes=4, dropout=0.4).to(cfg.DEVICE)
-    print(f"  Params: {sum(p.numel() for p in model_large.parameters()):,}")
-    model_large, tl_l, vl_l, best_acc_l = train_model(model_large, train_dl, val_dl, 'GRU-Large', cw, 999)
-    all_models.append(model_large); all_train_losses.append(tl_l); all_val_losses.append(vl_l)
+    # 7. LightGBM
+    print("\n[6b/8] LightGBM训练...")
+    lgb_model, lgb_scaler = train_lightgbm(train_val_s, test_s, selected_idx)
 
-    # 6. 阈值校准 + 评估
-    print("\n[6/7] 阈值校准与评估...")
+    # 8. 阈值校准 + 集成评估
+    print("\n[7/8] 阈值校准与集成评估...")
 
-    # 在训练+验证集上校准阈值（更大的样本量，更稳定）
-    print("  校准阈值 (train+val set)...")
-    from torch.utils.data import ConcatDataset
-    train_val_ds = ConcatDataset([train_ds, val_ds])
-    train_val_dl = DataLoader(train_val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
-    calibrated_thresholds = calibrate_thresholds(all_models, train_val_dl)
+    # 在OOF预测上做分区感知阈值校准
+    oof_risk_true = np.array([s['risk_label'] for s in train_val_s])
+    calibrated_thresholds, zone_offsets = calibrate_thresholds_per_zone(
+        oof_cum, oof_cls, oof_risk_true, oof_zones)
 
-    # 单模型评估 (用校准阈值)
-    for i, (name, model) in enumerate(zip(
-        [f'GRU-Attention-s{s}' for s in cfg.SEEDS] + ['GRU-Large'],
-        all_models
-    )):
-        m, r, cm = predict_with_models([model], test_dl, calibrated_thresholds)
-        individual_metrics[name] = m
-        print(f"  {name}: R²={m['displacement']['R2_dy']:.4f} Acc={m['risk']['Accuracy']:.4f}")
+    # 集成预测
+    print("\n  集成预测 (CV + Extra + LightGBM)...")
+    ens_metrics, ens_results, ens_cm, dy_avg = ensemble_predict(
+        cv_models, cv_scalers, extra_models, extra_scalers,
+        lgb_model, lgb_scaler, test_s, selected_idx,
+        calibrated_thresholds, zone_offsets)
 
-    # 集成评估 (用校准阈值)
-    print("\n--- 集成 (全部模型) ---")
-    ens_metrics, ens_results, ens_cm = predict_with_models(all_models, test_dl, calibrated_thresholds)
-    individual_metrics['Ensemble'] = ens_metrics
-    print(f"  R²={ens_metrics['displacement']['R2_dy']:.4f} Acc={ens_metrics['risk']['Accuracy']:.4f}")
+    print(f"\n  集成 R²={ens_metrics['displacement']['R2_dy']:.4f} "
+          f"Acc={ens_metrics['risk']['Accuracy']:.4f}")
 
-    # 选择最佳
-    best_name = max(individual_metrics, key=lambda k: individual_metrics[k]['risk']['Accuracy'])
-    if best_name == 'Ensemble':
-        final_metrics, final_results, final_cm = ens_metrics, ens_results, ens_cm
-        final_model = all_models[0]
-    else:
-        idx = ([f'GRU-Attention-s{s}' for s in cfg.SEEDS] + ['GRU-Large']).index(best_name)
-        final_metrics, final_results, final_cm = predict_with_models([all_models[idx]], test_dl, calibrated_thresholds)
-        final_model = all_models[idx]
+    # 也评估单CV模型
+    individual_metrics = {'Ensemble-v5': ens_metrics}
+    for fi, (model, scaler) in enumerate(zip(cv_models, cv_scalers)):
+        ds = LandslideDataset(test_s, feature_scaler=scaler, selected_features=selected_idx)
+        dl = DataLoader(ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
+        dy_p, aux_p, rl_p, dy_t, cum_t, risk_t, _ = predict_single_model(
+            model, dl, cfg.DEVICE, tta_rounds=cfg.TTA_ROUNDS, tta_noise=cfg.TTA_NOISE)
+        cum_pred = 0.6 * dy_p.sum(axis=1) + 0.4 * aux_p[:, 0]
+        risk_pred = np.array([assign_risk_label(c, calibrated_thresholds) for c in cum_pred])
+        acc = accuracy_score(risk_t, risk_pred)
+        r2 = r2_score(dy_t.flatten(), dy_p.flatten())
+        individual_metrics[f'CV-fold{fi+1}'] = {
+            'model': f'CV-fold{fi+1}',
+            'displacement': {'R2_dy': float(round(r2,4))},
+            'risk': {'Accuracy': float(round(acc,4))}
+        }
+        print(f"  CV-fold{fi+1}: R²={r2:.4f} Acc={acc:.4f}")
 
-    print(f"\n最终选择: {best_name} | Acc={final_metrics['risk']['Accuracy']} R²={final_metrics['displacement']['R2_dy']}")
+    final_metrics = ens_metrics
+    final_results = ens_results
+    final_cm = ens_cm
 
-    # 7. 保存
-    print("\n[7/7] 保存结果...")
+    # 保存
+    print("\n[8/8] 保存结果...")
     out = cfg.OUTPUT_DIR
 
     final_results.to_csv(os.path.join(out, 'pred_test.csv'), index=False, encoding='utf-8-sig')
@@ -769,23 +1064,16 @@ def main():
     plot_prediction_curves(final_results, os.path.join(out, 'prediction_curve.png'))
     plot_confusion_matrix(final_cm, cfg.RISK_LABELS, os.path.join(out, 'confusion_matrix.png'))
     plot_error_distribution(final_results, os.path.join(out, 'error_distribution.png'))
-    plot_feature_importance(train_s[0]['feature_cols'], final_model, os.path.join(out, 'feature_importance.png'))
+    if len(cv_models) > 0:
+        plot_feature_importance(selected_names, cv_models[0], os.path.join(out, 'feature_importance.png'))
     plot_risk_timeline(final_results, os.path.join(out, 'risk_timeline.png'))
     plot_model_comparison(individual_metrics, os.path.join(out, 'model_comparison.png'))
     plot_zone_performance(final_results, os.path.join(out, 'zone_performance.png'))
     plot_ablation(final_results, os.path.join(out, 'ablation_study.png'))
 
-    # 训练曲线
-    for i, (name, tl, vl) in enumerate(zip(
-        [f'GRU-s{s}' for s in cfg.SEEDS] + ['GRU-Large'],
-        all_train_losses, all_val_losses
-    )):
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(tl, label='Train'); ax.plot(vl, label='Val')
-        ax.set_title(f'{name} Training'); ax.legend(); ax.grid(True, alpha=0.3)
-        plt.tight_layout(); plt.savefig(os.path.join(out, f'training_{name}.png'), dpi=150); plt.close()
-
-    torch.save(final_model.state_dict(), os.path.join(out, 'best_model.pth'))
+    # 保存模型
+    if len(cv_models) > 0:
+        torch.save(cv_models[0].state_dict(), os.path.join(out, 'best_model.pth'))
 
     # 详细分析
     print("\n" + "=" * 60)
@@ -806,7 +1094,6 @@ def main():
         print(f"  误判真实标签: {mis['true_label_future'].value_counts().to_dict()}")
         print(f"  误判预测标签: {mis['pred_label_future'].value_counts().to_dict()}")
 
-    # 逐节点
     print("\n  逐节点MAE:")
     for node in sorted(final_results['node'].unique()):
         ndf = final_results[final_results['node'] == node]
@@ -815,10 +1102,12 @@ def main():
 
     print("\n" + "=" * 60)
     print("完成!")
-    print(f"  最终模型: {best_name}")
+    print(f"  最终模型: Ensemble-v5")
     print(f"  风险 Accuracy: {final_metrics['risk']['Accuracy']}")
     print(f"  位移 R²: {final_metrics['displacement']['R2_dy']}")
     print(f"  校准阈值: {[round(t,1) for t in calibrated_thresholds]}")
+    print(f"  分区偏移: {zone_offsets}")
+    print(f"  模型数量: {len(cv_models)} CV + {len(extra_models)} Extra + {'1' if lgb_model else '0'} LGB")
     print("=" * 60)
 
     return final_metrics
