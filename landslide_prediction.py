@@ -48,9 +48,9 @@ class Config:
     OUTPUT_DIR = os.path.dirname(__file__)
 
     W = 12; H = 3
-    HIDDEN_DIM = 256; NUM_LAYERS = 2; DROPOUT = 0.15
-    BATCH_SIZE = 32; EPOCHS = 200; LR = 5e-4; WEIGHT_DECAY = 1e-5
-    LAMBDA_CLS = 1.0; LAMBDA_AUX = 0.3; PATIENCE = 30
+    HIDDEN_DIM = 128; NUM_LAYERS = 2; DROPOUT = 0.35
+    BATCH_SIZE = 32; EPOCHS = 200; LR = 1e-3; WEIGHT_DECAY = 5e-4
+    LAMBDA_CLS = 0.8; LAMBDA_AUX = 0.2; PATIENCE = 25
 
     RISK_THRESHOLDS = [10, 22, 38]
     RISK_LABELS = ['蓝色低风险', '黄色关注', '橙色预警', '红色高危']
@@ -231,7 +231,8 @@ class FocalLoss(nn.Module):
         return (((1 - torch.exp(-ce)) ** self.gamma) * ce).mean()
 
 class MultiTaskGRU(nn.Module):
-    def __init__(self, input_dim, hidden_dim=256, num_layers=2, num_classes=4, dropout=0.15):
+    """精简GRU - 减少过拟合"""
+    def __init__(self, input_dim, hidden_dim=128, num_layers=2, num_classes=4, dropout=0.35):
         super().__init__()
         self.input_proj = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU())
         self.gru = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=num_layers,
@@ -240,14 +241,14 @@ class MultiTaskGRU(nn.Module):
         self.attention = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
 
         self.regress_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, 3))
+            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim//2, 3))
         self.aux_regress_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden_dim//2, 3))
         self.classify_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, num_classes))
+            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim//2, num_classes))
 
     def forward(self, x):
         x = self.input_proj(x)
@@ -257,8 +258,8 @@ class MultiTaskGRU(nn.Module):
         return self.regress_head(ctx), self.aux_regress_head(ctx), self.classify_head(ctx)
 
 class MultiTaskGRULarge(nn.Module):
-    """更大GRU变体 - 3层 + 更宽"""
-    def __init__(self, input_dim, hidden_dim=512, num_layers=3, num_classes=4, dropout=0.2):
+    """更大但正则化更强的GRU"""
+    def __init__(self, input_dim, hidden_dim=256, num_layers=2, num_classes=4, dropout=0.4):
         super().__init__()
         self.input_proj = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU())
         self.gru = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=num_layers,
@@ -267,14 +268,14 @@ class MultiTaskGRULarge(nn.Module):
         self.attention = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
 
         self.regress_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, 3))
+            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim//2, 3))
         self.aux_regress_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden_dim//2, 3))
         self.classify_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, num_classes))
+            nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim//2, num_classes))
 
     def forward(self, x):
         x = self.input_proj(x)
@@ -297,7 +298,8 @@ def train_model(model, train_loader, val_loader, model_name='model', class_weigh
     cw = torch.FloatTensor(class_weights).to(cfg.DEVICE) if class_weights else None
     focal = FocalLoss(alpha=cw, gamma=2.0)
 
-    best_val_r2 = -1; best_state = None; pat = 0
+    # 早停指标: 验证集风险Accuracy (最终目标)
+    best_val_acc = 0; best_state = None; pat = 0
     train_losses, val_losses = [], []
 
     for epoch in range(cfg.EPOCHS):
@@ -319,9 +321,11 @@ def train_model(model, train_loader, val_loader, model_name='model', class_weigh
         scheduler.step()
         train_losses.append(eloss / max(nb, 1))
 
-        # 验证 - 用位移R²作为early stopping指标
+        # 验证 - 用风险Accuracy作为early stopping指标
         model.eval(); vloss = 0; vb = 0
-        all_pred = []; all_true = []
+        all_dy_pred, all_dy_true = [], []
+        all_cum_pred, all_cum_true = [], []
+        all_risk_pred, all_risk_true = [], []
         with torch.no_grad():
             for batch in val_loader:
                 feat = batch['features'].to(cfg.DEVICE)
@@ -333,43 +337,54 @@ def train_model(model, train_loader, val_loader, model_name='model', class_weigh
                 dy_p, aux_p, rl_p = model(feat)
                 loss = mse_loss(dy_p, f_dy) + cfg.LAMBDA_AUX * mse_loss(aux_p, torch.cat([c_dy,m_dy,a_dy],-1)) + cfg.LAMBDA_CLS * focal(rl_p, rl)
                 vloss += loss.item(); vb += 1
-                all_pred.append(dy_p.cpu().numpy()); all_true.append(f_dy.cpu().numpy())
+
+                # 收集预测用于计算val acc
+                all_dy_pred.append(dy_p.cpu().numpy())
+                all_dy_true.append(f_dy.cpu().numpy())
+                all_cum_pred.append((0.6*dy_p.cpu().numpy().sum(axis=1) + 0.4*aux_p.cpu().numpy()[:,0]))
+                all_cum_true.append(c_dy.cpu().numpy().flatten())
+                all_risk_pred.append(rl_p.argmax(dim=-1).cpu().numpy())
+                all_risk_true.append(rl.cpu().numpy())
 
         val_losses.append(vloss / max(vb, 1))
-        pred_flat = np.concatenate(all_pred).flatten(); true_flat = np.concatenate(all_true).flatten()
-        val_r2 = r2_score(true_flat, pred_flat)
 
-        if val_r2 > best_val_r2:
-            best_val_r2 = val_r2
+        # 计算val risk accuracy (用位移→阈值)
+        cum_pred = np.concatenate(all_cum_pred)
+        risk_true = np.concatenate(all_risk_true)
+        risk_pred = np.array([assign_risk_label(c) for c in cum_pred])
+        val_acc = accuracy_score(risk_true, risk_pred)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             pat = 0
         else:
             pat += 1
 
         if (epoch + 1) % 30 == 0:
-            print(f"  [{model_name}] Ep {epoch+1}/{cfg.EPOCHS} | TL:{train_losses[-1]:.4f} VL:{val_losses[-1]:.4f} R²:{val_r2:.4f} Best:{best_val_r2:.4f}")
+            print(f"  [{model_name}] Ep {epoch+1}/{cfg.EPOCHS} | TL:{train_losses[-1]:.4f} VL:{val_losses[-1]:.4f} ValAcc:{val_acc:.4f} Best:{best_val_acc:.4f}")
         if pat >= cfg.PATIENCE:
-            print(f"  [{model_name}] Early stop at ep {epoch+1} (best R²:{best_val_r2:.4f})")
+            print(f"  [{model_name}] Early stop at ep {epoch+1} (best ValAcc:{best_val_acc:.4f})")
             break
 
     model.load_state_dict(best_state); model = model.to(cfg.DEVICE)
-    return model, train_losses, val_losses, best_val_r2
+    return model, train_losses, val_losses, best_val_acc
 
 # ===================== 5. 阈值校准 =====================
 
-def calibrate_thresholds(models, val_loader, base_thresholds=None):
+def calibrate_thresholds(models, train_val_loader, base_thresholds=None):
     """
-    在验证集上搜索最优阈值偏移量
-    作业要求明确允许: "阈值校准只能使用训练集或训练/验证集信息"
+    在训练集+验证集上统计位移预测偏差，做保守阈值校准。
+    不用grid search（验证集太小易过拟合），而是用预测偏差的统计分布。
     """
     base = base_thresholds or cfg.RISK_THRESHOLDS
 
-    # 收集验证集预测
-    all_pred_cum = []; all_true_cum = []; all_true_labels = []
+    # 收集训练+验证集预测
+    all_pred_cum = []; all_true_cum = []
     for model in models:
         model.eval()
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in train_val_loader:
             feat = batch['features'].to(cfg.DEVICE)
             preds = []
             for model in models:
@@ -378,24 +393,20 @@ def calibrate_thresholds(models, val_loader, base_thresholds=None):
             avg_pred = np.mean(preds, axis=0)
             all_pred_cum.append(avg_pred)
             all_true_cum.append(batch['cum_dy'].numpy().flatten())
-            all_true_labels.append(batch['risk_label'].squeeze(-1).numpy())
 
     pred_cum = np.concatenate(all_pred_cum)
-    true_labels = np.concatenate(all_true_labels)
+    true_cum = np.concatenate(all_true_cum)
 
-    # 网格搜索最优偏移
-    best_acc = 0; best_offsets = (0, 0, 0)
-    for o1 in np.arange(-3, 3.5, 0.5):
-        for o2 in np.arange(-3, 3.5, 0.5):
-            for o3 in np.arange(-3, 3.5, 0.5):
-                t = [base[0]+o1, base[1]+o2, base[2]+o3]
-                pred_labels = np.array([assign_risk_label(c, t) for c in pred_cum])
-                acc = accuracy_score(true_labels, pred_labels)
-                if acc > best_acc:
-                    best_acc = acc; best_offsets = (o1, o2, o3)
+    # 计算每个阈值附近的预测偏差
+    bias = pred_cum - true_cum  # 预测 - 真实
+    mean_bias = np.mean(bias)
+    std_bias = np.std(bias)
 
-    calibrated = [base[i] + best_offsets[i] for i in range(3)]
-    print(f"  阈值校准: {base} → {[round(t,1) for t in calibrated]} (Val Acc: {best_acc:.4f})")
+    # 保守校准: 如果系统性高估，阈值下调；系统性低估，阈值上调
+    # 用 bias 的 25% 分位数作为偏移量（不过度拟合）
+    offset = np.clip(mean_bias * 0.5, -2.0, 2.0)
+    calibrated = [base[i] + offset for i in range(3)]
+    print(f"  阈值校准: {base} → {[round(t,2) for t in calibrated]} (mean_bias={mean_bias:.2f}, offset={offset:.2f})")
     return calibrated
 
 # ===================== 6. 预测与评估 =====================
@@ -697,24 +708,27 @@ def main():
         model = MultiTaskGRU(input_dim=input_dim, hidden_dim=cfg.HIDDEN_DIM,
                              num_layers=cfg.NUM_LAYERS, num_classes=4, dropout=cfg.DROPOUT).to(cfg.DEVICE)
         print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
-        model, tl, vl, best_r2 = train_model(model, train_dl, val_dl, name, cw, seed)
+        model, tl, vl, best_acc = train_model(model, train_dl, val_dl, name, cw, seed)
         all_models.append(model); all_train_losses.append(tl); all_val_losses.append(vl)
 
     # 改进: GRU-Large
     print(f"\n--- GRU-Large ---")
     set_seed(999)
     model_large = MultiTaskGRULarge(input_dim=input_dim, hidden_dim=cfg.HIDDEN_DIM*2,
-                                     num_layers=3, num_classes=4, dropout=0.2).to(cfg.DEVICE)
+                                     num_layers=2, num_classes=4, dropout=0.4).to(cfg.DEVICE)
     print(f"  Params: {sum(p.numel() for p in model_large.parameters()):,}")
-    model_large, tl_l, vl_l, best_r2_l = train_model(model_large, train_dl, val_dl, 'GRU-Large', cw, 999)
+    model_large, tl_l, vl_l, best_acc_l = train_model(model_large, train_dl, val_dl, 'GRU-Large', cw, 999)
     all_models.append(model_large); all_train_losses.append(tl_l); all_val_losses.append(vl_l)
 
     # 6. 阈值校准 + 评估
     print("\n[6/7] 阈值校准与评估...")
 
-    # 在验证集上校准阈值
-    print("  校准阈值 (validation set)...")
-    calibrated_thresholds = calibrate_thresholds(all_models, val_dl)
+    # 在训练+验证集上校准阈值（更大的样本量，更稳定）
+    print("  校准阈值 (train+val set)...")
+    from torch.utils.data import ConcatDataset
+    train_val_ds = ConcatDataset([train_ds, val_ds])
+    train_val_dl = DataLoader(train_val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False)
+    calibrated_thresholds = calibrate_thresholds(all_models, train_val_dl)
 
     # 单模型评估 (用校准阈值)
     for i, (name, model) in enumerate(zip(
