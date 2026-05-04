@@ -82,10 +82,24 @@ class Config:
     TRAIN_END = '2023-12'
     VAL_END = '2024-06'
 
-    # 设备
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 设备 - 安全检测CUDA是否真正可用
+    @staticmethod
+    def _detect_device():
+        if not torch.cuda.is_available():
+            return torch.device('cpu')
+        try:
+            # 实际尝试在GPU上创建tensor来验证CUDA kernel可用
+            _ = torch.zeros(1).cuda()
+            return torch.device('cuda')
+        except (torch.cuda.CudaError, RuntimeError):
+            print("[WARN] CUDA reported available but kernel execution failed, falling back to CPU")
+            return torch.device('cpu')
+
+    DEVICE = _detect_device.__func__()
 
 cfg = Config()
+# 触发设备检测
+cfg.__class__.DEVICE = cfg._detect_device()
 print(f"[INFO] Device: {cfg.DEVICE}")
 
 # ===================== 1. 数据加载与特征工程 =====================
