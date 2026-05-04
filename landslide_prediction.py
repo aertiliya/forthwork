@@ -43,8 +43,56 @@ except ImportError:
     HAS_LGB = False
 
 warnings.filterwarnings('ignore')
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+
+# 自动检测可用中文字体 (兼容Kaggle/本地环境)
+def _setup_chinese_font():
+    import matplotlib.font_manager as fm
+    # 常见中文字体列表, 按优先级排序
+    chinese_fonts = [
+        'SimHei', 'Microsoft YaHei', 'PingFang SC', 'Heiti SC',
+        'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei',
+        'Noto Sans CJK SC', 'Source Han Sans SC',
+        'Arial Unicode MS', 'Droid Sans Fallback',
+    ]
+    available = {f.name for f in fm.fontManager.ttflist}
+    for font in chinese_fonts:
+        if font in available:
+            plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
+            return font
+    # 都没有则尝试从系统字体文件找
+    import subprocess
+    try:
+        result = subprocess.run(['fc-list', ':lang=zh', 'family'], capture_output=True, text=True)
+        families = set(result.stdout.strip().split('\n')) - {''}
+        if families:
+            chosen = sorted(families)[0]
+            plt.rcParams['font.sans-serif'] = [chosen, 'DejaVu Sans']
+            return chosen
+    except: pass
+    # 最终fallback: 下载并使用开源中文字体
+    try:
+        import urllib.request
+        font_url = 'https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf'
+        font_dir = os.path.join(os.path.dirname(__file__), '.cache')
+        os.makedirs(font_dir, exist_ok=True)
+        font_path = os.path.join(font_dir, 'SimHei.ttf')
+        if not os.path.exists(font_path):
+            urllib.request.urlretrieve(font_url, font_path)
+        fm.fontManager.addfont(font_path)
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+        return 'SimHei (downloaded)'
+    except Exception as e:
+        pass
+    # 确实找不到, 至少不报错但警告
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    return None
+
+_used_font = _setup_chinese_font()
 plt.rcParams['axes.unicode_minus'] = False
+if _used_font:
+    print(f"[INFO] Font: {_used_font}")
+else:
+    print("[WARN] No Chinese font found, charts may show garbled text")
 
 def _softmax(x):
     e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
