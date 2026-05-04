@@ -647,9 +647,8 @@ def predict_single_model(model, dataloader, device, tta_rounds=0, tta_noise=0.01
     """单模型预测, 支持TTA"""
     model.eval()
     dy_p_list, aux_p_list, rl_p_list = [], [], []
-    gt_data = {'nodes': [], 'months': [], 'zones': [],
-               'future_dy': [], 'cum_dy': [], 'risk_label': []}
-    first_batch = True
+    gt_nodes, gt_months, gt_zones = [], [], []
+    gt_future_dy, gt_cum_dy, gt_risk_label = [], [], []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -673,21 +672,25 @@ def predict_single_model(model, dataloader, device, tta_rounds=0, tta_noise=0.01
             aux_p_list.append(aux_p.cpu().numpy())
             rl_p_list.append(rl_p.cpu().numpy())
 
-            if first_batch:
-                gt_data['nodes'].extend(batch['node'])
-                gt_data['months'].extend(batch['month'])
-                gt_data['zones'].extend(batch['zone'])
-                gt_data['future_dy'].append(batch['future_dy'].numpy())
-                gt_data['cum_dy'].append(batch['cum_dy'].numpy().flatten())
-                gt_data['risk_label'].append(batch['risk_label'].squeeze(-1).numpy())
-                first_batch = False
+            # 始终从所有batch收集GT
+            gt_nodes.extend(batch['node'])
+            gt_months.extend(batch['month'])
+            gt_zones.extend(batch['zone'])
+            gt_future_dy.append(batch['future_dy'].numpy())
+            gt_cum_dy.append(batch['cum_dy'].numpy().flatten())
+            gt_risk_label.append(batch['risk_label'].squeeze(-1).numpy())
 
     dy_pred = np.concatenate(dy_p_list)
     aux_pred = np.concatenate(aux_p_list)
     rl_pred = np.concatenate(rl_p_list)
-    dy_true = np.concatenate(gt_data['future_dy'])
-    cum_true = np.concatenate(gt_data['cum_dy'])
-    risk_true = np.concatenate(gt_data['risk_label'])
+    dy_true = np.concatenate(gt_future_dy)
+    cum_true = np.concatenate(gt_cum_dy)
+    risk_true = np.concatenate(gt_risk_label)
+
+    gt_data = {
+        'nodes': gt_nodes, 'months': gt_months, 'zones': gt_zones,
+        'future_dy': gt_future_dy, 'cum_dy': gt_cum_dy, 'risk_label': gt_risk_label,
+    }
 
     return dy_pred, aux_pred, rl_pred, dy_true, cum_true, risk_true, gt_data
 
