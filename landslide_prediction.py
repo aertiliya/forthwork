@@ -43,56 +43,15 @@ except ImportError:
     HAS_LGB = False
 
 warnings.filterwarnings('ignore')
-
-# 自动检测可用中文字体 (兼容Kaggle/本地环境)
-def _setup_chinese_font():
-    import matplotlib.font_manager as fm
-    # 常见中文字体列表, 按优先级排序
-    chinese_fonts = [
-        'SimHei', 'Microsoft YaHei', 'PingFang SC', 'Heiti SC',
-        'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei',
-        'Noto Sans CJK SC', 'Source Han Sans SC',
-        'Arial Unicode MS', 'Droid Sans Fallback',
-    ]
-    available = {f.name for f in fm.fontManager.ttflist}
-    for font in chinese_fonts:
-        if font in available:
-            plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
-            return font
-    # 都没有则尝试从系统字体文件找
-    import subprocess
-    try:
-        result = subprocess.run(['fc-list', ':lang=zh', 'family'], capture_output=True, text=True)
-        families = set(result.stdout.strip().split('\n')) - {''}
-        if families:
-            chosen = sorted(families)[0]
-            plt.rcParams['font.sans-serif'] = [chosen, 'DejaVu Sans']
-            return chosen
-    except: pass
-    # 最终fallback: 下载并使用开源中文字体
-    try:
-        import urllib.request
-        font_url = 'https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf'
-        font_dir = os.path.join(os.path.dirname(__file__), '.cache')
-        os.makedirs(font_dir, exist_ok=True)
-        font_path = os.path.join(font_dir, 'SimHei.ttf')
-        if not os.path.exists(font_path):
-            urllib.request.urlretrieve(font_url, font_path)
-        fm.fontManager.addfont(font_path)
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
-        return 'SimHei (downloaded)'
-    except Exception as e:
-        pass
-    # 确实找不到, 至少不报错但警告
-    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
-    return None
-
-_used_font = _setup_chinese_font()
+# Use English for all charts (Kaggle lacks CJK fonts)
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
-if _used_font:
-    print(f"[INFO] Font: {_used_font}")
-else:
-    print("[WARN] No Chinese font found, charts may show garbled text")
+
+# English labels for visualization
+RISK_LABELS_EN = ['Blue', 'Yellow', 'Orange', 'Red']
+ZONE_NAMES_EN = {'强变形带': 'Strong Deform', '过渡变形带': 'Transitional', '稳定背景带': 'Stable'}
+ZONE_ORDER = ['Strong Deform', 'Transitional', 'Stable']
+RISK_COLOR_MAP = {'Blue': 'royalblue', 'Yellow': 'gold', 'Orange': 'darkorange', 'Red': 'red'}
 
 def _softmax(x):
     e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
@@ -688,6 +647,7 @@ def plot_prediction_curves(results_df, save_path):
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
     for idx, zone in enumerate(['强变形带', '过渡变形带', '稳定背景带']):
         zone_df = results_df[results_df['zone'] == zone]
+        zone_en = ZONE_NAMES_EN.get(zone, zone)
         if len(zone_df) == 0: continue
         nodes = zone_df['node'].unique()[:2]
         for j, node in enumerate(nodes):
@@ -697,7 +657,7 @@ def plot_prediction_curves(results_df, save_path):
             ax.plot(x, ndf['true_cum_dy_H'].values, 'b-o', ms=3, label='True')
             ax.plot(x, ndf['pred_cum_dy_H'].values, 'r--s', ms=3, label='Pred')
             ax.fill_between(x, ndf['true_cum_dy_H'].values, ndf['pred_cum_dy_H'].values, alpha=0.15, color='red')
-            ax.set_title(f'{zone} - {node}'); ax.legend(); ax.grid(True, alpha=0.3)
+            ax.set_title(f'{zone_en} - {node}'); ax.legend(); ax.grid(True, alpha=0.3)
             ax.set_xlabel('Time Step'); ax.set_ylabel('Cum Disp (mm)')
     plt.suptitle('Prediction Curves by Zone & Node', fontsize=14)
     plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
@@ -706,8 +666,9 @@ def plot_confusion_matrix(cm, labels, save_path):
     fig, ax = plt.subplots(figsize=(8, 6))
     im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
     ax.figure.colorbar(im, ax=ax)
+    en_labels = [RISK_LABELS_EN[i] if i < len(RISK_LABELS_EN) else str(i) for i in range(len(labels))]
     ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
-           xticklabels=labels, yticklabels=labels, title='Confusion Matrix',
+           xticklabels=en_labels, yticklabels=en_labels, title='Confusion Matrix',
            ylabel='True', xlabel='Predicted')
     thresh = cm.max() / 2.
     for i in range(cm.shape[0]):
@@ -723,8 +684,10 @@ def plot_error_distribution(results_df, save_path):
     axes[0,0].axvline(0, color='red', ls='--'); axes[0,0].set_title('Cum Disp Error Dist')
     axes[0,0].set_xlabel('Error (mm)'); axes[0,0].set_ylabel('Count')
 
+    # MAE by Zone
     zone_maes = results_df.groupby('zone').apply(lambda x: np.mean(np.abs(x['true_cum_dy_H'] - x['pred_cum_dy_H'])))
     colors = {'强变形带': '#e74c3c', '过渡变形带': '#f39c12', '稳定背景带': '#2ecc71'}
+    zone_maes.index = [ZONE_NAMES_EN.get(z, z) for z in zone_maes.index]
     zone_maes.plot(kind='bar', ax=axes[0,1], color=[colors.get(z, 'gray') for z in zone_maes.index])
     axes[0,1].set_title('MAE by Zone'); axes[0,1].set_ylabel('MAE (mm)')
     axes[0,1].tick_params(axis='x', rotation=0)
@@ -770,9 +733,9 @@ def plot_risk_timeline(results_df, save_path):
         ndf = zdf[zdf['node'] == node].sort_values('month').reset_index(drop=True)
         x = range(len(ndf))
         for i, row in ndf.iterrows():
-            ax.bar(i, 1, color=rc.get(row['true_label_future'], 'gray'), alpha=0.3)
-            ax.bar(i, 0.5, color=rc.get(row['pred_label_future'], 'gray'), alpha=0.9)
-        ax.set_title(f'{zone} - {node} (Top=True, Bottom=Pred)')
+            ax.bar(i, 1, color=RISK_COLOR_MAP.get(row['true_label_future'], 'gray'), alpha=0.3)
+            ax.bar(i, 0.5, color=RISK_COLOR_MAP.get(row['pred_label_future'], 'gray'), alpha=0.9)
+        ax.set_title(f'{ZONE_NAMES_EN[zone]} - {node} (Top=True, Bottom=Pred)')
         ax.set_ylabel('Risk'); ax.set_yticks([])
     plt.suptitle('Risk Level Timeline', fontsize=14)
     plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
@@ -805,9 +768,9 @@ def plot_zone_performance(results_df, save_path):
         pred_l = zdf['pred_label_future'].map(label_map)
         zcm = confusion_matrix(true_l, pred_l, labels=list(range(4)))
         im = ax.imshow(zcm, cmap='Blues')
-        ax.set_title(f'{zone} (N={len(zdf)})'); ax.set_xlabel('Pred'); ax.set_ylabel('True')
-        ax.set_xticks(range(4)); ax.set_xticklabels(['蓝','黄','橙','红'], fontsize=8)
-        ax.set_yticks(range(4)); ax.set_yticklabels(['蓝','黄','橙','红'], fontsize=8)
+        ax.set_title(f'{ZONE_NAMES_EN[zone]} (N={len(zdf)})'); ax.set_xlabel('Pred'); ax.set_ylabel('True')
+        ax.set_xticks(range(4)); ax.set_xticklabels(RISK_LABELS_EN, fontsize=8)
+        ax.set_yticks(range(4)); ax.set_yticklabels(RISK_LABELS_EN, fontsize=8)
         for i in range(4):
             for j in range(4):
                 ax.text(j, i, zcm[i,j], ha='center', va='center', fontsize=10)
@@ -816,10 +779,11 @@ def plot_zone_performance(results_df, save_path):
 
 def plot_ablation(results_df, save_path):
     fig, ax = plt.subplots(figsize=(8, 5))
-    zones = ['强变形带', '过渡变形带', '稳定背景带']
+    zones = ZONE_ORDER
+    zone_cn = ['强变形带', '过渡变形带', '稳定背景带']
     with_insar = []; without_insar = []
-    for z in zones:
-        zdf = results_df[results_df['zone'] == z]
+    for z_cn, z_en in zip(zone_cn, zones):
+        zdf = results_df[results_df['zone'] == z_cn]
         r2 = r2_score(zdf['true_cum_dy_H'], zdf['pred_cum_dy_H'])
         with_insar.append(r2)
         without_insar.append(max(0, r2 - np.random.uniform(0.02, 0.08)))
@@ -912,7 +876,7 @@ def main():
 
     # 所有图表
     plot_prediction_curves(final_results, os.path.join(out, 'prediction_curve.png'))
-    plot_confusion_matrix(final_cm, cfg.RISK_LABELS, os.path.join(out, 'confusion_matrix.png'))
+    plot_confusion_matrix(final_cm, RISK_LABELS_EN, os.path.join(out, 'confusion_matrix.png'))
     plot_error_distribution(final_results, os.path.join(out, 'error_distribution.png'))
     if len(models) > 0:
         plot_feature_importance(selected_names, models[0], os.path.join(out, 'feature_importance.png'))
