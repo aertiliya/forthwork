@@ -766,8 +766,22 @@ def evaluate_model(model, dataloader, dataset, model_name='model'):
     cum_true = np.concatenate(all_cum_true, axis=0).flatten()
     cum_pred = np.concatenate(all_cum_pred, axis=0).flatten()
     risk_true = np.concatenate(all_risk_true, axis=0)
-    risk_pred = np.concatenate(all_risk_pred, axis=0)
+    risk_pred_logits = np.concatenate(all_risk_pred, axis=0)  # 分类头预测
     probs = np.concatenate(all_probs, axis=0)
+
+    # === 核心改进: 位移预测→阈值分级 (比分类头更准) ===
+    pred_cum_from_dy = dy_pred.sum(axis=1)          # 回归头位移求和
+    pred_cum_combined = 0.6 * pred_cum_from_dy + 0.4 * cum_pred  # 加权
+    risk_pred_from_disp = np.array([assign_risk_label(c) for c in pred_cum_combined])
+
+    # 边界修正: 靠近阈值且分类头置信度高时信任分类头
+    risk_pred = risk_pred_from_disp.copy()
+    for i in range(len(risk_pred)):
+        cum_i = pred_cum_combined[i]
+        dists = [abs(cum_i - t) for t in cfg.RISK_THRESHOLDS]
+        min_dist = min(dists)
+        if min_dist < 2.0 and probs[i].max() > 0.6:
+            risk_pred[i] = risk_pred_logits[i]
 
     # === 位移预测指标 ===
     mae_dy = mean_absolute_error(dy_true.flatten(), dy_pred.flatten())
@@ -885,21 +899,52 @@ def ensemble_predict(models, dataloader):
         all_risk_logits.append(np.concatenate(risk_logits_list))
         all_meta.append(meta_list[0])
 
-    # 平均集成
+    # 平均集成 - 位移预测
     dy_pred_avg = np.mean(all_dy_preds, axis=0)
     aux_pred_avg = np.mean(all_aux_preds, axis=0)
     risk_logits_avg = np.mean(all_risk_logits, axis=0)
 
-    risk_pred = risk_logits_avg.argmax(axis=-1)
-    probs = np.softmax(risk_logits_avg, axis=-1)
-
     meta = all_meta[0]
-
-    # 指标计算
     dy_true = meta['future_dy']
     cum_true = meta['cum_dy']
     risk_true = meta['risk_labels']
 
+    # ===== 核心改进: 双路径风险预测 =====
+    # 路径1: 分类头直接预测
+    risk_pred_from_logits = risk_logits_avg.argmax(axis=-1)
+
+    # 路径2: 用位移预测的累计值按阈值分级（更可靠）
+    pred_cum_from_dy = dy_pred_avg.sum(axis=1)  # 用回归头预测的位移求和
+    pred_cum_from_aux = aux_pred_avg[:, 0]       # 辅助头直接预测的累计位移
+    # 两者加权平均
+    pred_cum_combined = 0.6 * pred_cum_from_dy + 0.4 * pred_cum_from_aux
+    risk_pred_from_disp = np.array([assign_risk_label(c) for c in pred_cum_combined])
+
+    # 路径3: 分类头概率 + 位移分级投票
+    # 对每个样本，如果路径2的置信度高（接近阈值边界用分类头，否则用位移路径）
+    risk_pred_final = risk_pred_from_disp.copy()  # 默认用位移路径（更准）
+
+    # softmax兼容实现
+    def _softmax(x):
+        e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        return e_x / e_x.sum(axis=-1, keepdims=True)
+
+    probs_logits = _softmax(risk_logits_avg)
+
+    # 对于位移路径给出的置信度较低的样本（接近阈值边界），用分类头修正
+    for i in range(len(risk_pred_final)):
+        cum_pred_i = pred_cum_combined[i]
+        # 计算到最近阈值的距离
+        dists = [abs(cum_pred_i - t) for t in cfg.RISK_THRESHOLDS]
+        min_dist = min(dists)
+        # 如果很接近阈值边界且分类头置信度高，信任分类头
+        if min_dist < 2.0 and probs_logits[i].max() > 0.6:
+            risk_pred_final[i] = risk_pred_from_logits[i]
+
+    risk_pred = risk_pred_final
+    probs = probs_logits  # 用分类头的概率作为置信度
+
+    # 指标计算
     mae_dy = mean_absolute_error(dy_true.flatten(), dy_pred_avg.flatten())
     rmse_dy = np.sqrt(mean_squared_error(dy_true.flatten(), dy_pred_avg.flatten()))
     r2_dy = r2_score(dy_true.flatten(), dy_pred_avg.flatten())
