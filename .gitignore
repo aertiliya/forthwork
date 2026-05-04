@@ -1,0 +1,7 @@
+data/node_info.csv
+data/monthly_multisource_features.csv
+data/rainfall_waterlevel_daily.csv
+data/README_数据说明.md
+data/samples_H3_W12.csv
+metrics.json
+pred_test.csv
