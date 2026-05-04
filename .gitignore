@@ -5,3 +5,7 @@ data/README_数据说明.md
 data/samples_H3_W12.csv
 metrics.json
 pred_test.csv
+__pycache__/landslide_prediction.cpython-310.pyc
+.workbuddy/memory/MEMORY.md
+.workbuddy/memory/2026-05-04.md
+上机四_滑坡位移预测.docx

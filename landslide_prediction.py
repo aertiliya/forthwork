@@ -860,21 +860,30 @@ def evaluate_model(model, dataloader, dataset, model_name='model'):
 # ===================== 7. 集成预测 =====================
 
 def ensemble_predict(models, dataloader):
-    """多模型集成预测"""
+    """多模型集成预测 - 修复版：正确收集所有batch的meta"""
     all_dy_preds = []
     all_aux_preds = []
     all_risk_logits = []
-    all_meta = []
+
+    # 收集所有ground truth（只做一次，和模型无关）
+    gt_nodes = []
+    gt_months = []
+    gt_zones = []
+    gt_future_dy = []
+    gt_cum_dy = []
+    gt_max_dy = []
+    gt_avg_dy = []
+    gt_risk_labels = []
 
     for model in models:
         model.eval()
         dy_preds = []
         aux_preds = []
         risk_logits_list = []
-        meta_list = []
+        is_first_model = (len(all_dy_preds) == 0)
 
         with torch.no_grad():
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
                 features = batch['features'].to(cfg.DEVICE)
                 dy_pred, aux_pred, risk_logits = model(features)
 
@@ -882,67 +891,61 @@ def ensemble_predict(models, dataloader):
                 aux_preds.append(aux_pred.cpu().numpy())
                 risk_logits_list.append(risk_logits.cpu().numpy())
 
-                if len(meta_list) == 0:
-                    meta_list.append({
-                        'nodes': batch['node'],
-                        'months': batch['month'],
-                        'zones': batch['zone'],
-                        'future_dy': batch['future_dy'].numpy(),
-                        'cum_dy': batch['cum_dy'].numpy().flatten(),
-                        'max_dy': batch['max_dy'].numpy().flatten(),
-                        'avg_dy': batch['avg_dy'].numpy().flatten(),
-                        'risk_labels': batch['risk_label'].squeeze(-1).numpy(),
-                    })
+                # 只在第一个模型时收集ground truth
+                if is_first_model:
+                    gt_nodes.extend(batch['node'])
+                    gt_months.extend(batch['month'])
+                    gt_zones.extend(batch['zone'])
+                    gt_future_dy.append(batch['future_dy'].numpy())
+                    gt_cum_dy.append(batch['cum_dy'].numpy().flatten())
+                    gt_max_dy.append(batch['max_dy'].numpy().flatten())
+                    gt_avg_dy.append(batch['avg_dy'].numpy().flatten())
+                    gt_risk_labels.append(batch['risk_label'].squeeze(-1).numpy())
 
         all_dy_preds.append(np.concatenate(dy_preds))
         all_aux_preds.append(np.concatenate(aux_preds))
         all_risk_logits.append(np.concatenate(risk_logits_list))
-        all_meta.append(meta_list[0])
+
+    # 合并ground truth
+    dy_true = np.concatenate(gt_future_dy, axis=0)      # (N, H)
+    cum_true = np.concatenate(gt_cum_dy, axis=0)          # (N,)
+    max_true = np.concatenate(gt_max_dy, axis=0)
+    avg_true = np.concatenate(gt_avg_dy, axis=0)
+    risk_true = np.concatenate(gt_risk_labels, axis=0)    # (N,)
 
     # 平均集成 - 位移预测
     dy_pred_avg = np.mean(all_dy_preds, axis=0)
     aux_pred_avg = np.mean(all_aux_preds, axis=0)
     risk_logits_avg = np.mean(all_risk_logits, axis=0)
 
-    meta = all_meta[0]
-    dy_true = meta['future_dy']
-    cum_true = meta['cum_dy']
-    risk_true = meta['risk_labels']
-
     # ===== 核心改进: 双路径风险预测 =====
     # 路径1: 分类头直接预测
     risk_pred_from_logits = risk_logits_avg.argmax(axis=-1)
 
     # 路径2: 用位移预测的累计值按阈值分级（更可靠）
-    pred_cum_from_dy = dy_pred_avg.sum(axis=1)  # 用回归头预测的位移求和
-    pred_cum_from_aux = aux_pred_avg[:, 0]       # 辅助头直接预测的累计位移
-    # 两者加权平均
+    pred_cum_from_dy = dy_pred_avg.sum(axis=1)
+    pred_cum_from_aux = aux_pred_avg[:, 0]
     pred_cum_combined = 0.6 * pred_cum_from_dy + 0.4 * pred_cum_from_aux
     risk_pred_from_disp = np.array([assign_risk_label(c) for c in pred_cum_combined])
 
-    # 路径3: 分类头概率 + 位移分级投票
-    # 对每个样本，如果路径2的置信度高（接近阈值边界用分类头，否则用位移路径）
-    risk_pred_final = risk_pred_from_disp.copy()  # 默认用位移路径（更准）
+    # 默认用位移路径（更准），边界附近信任分类头
+    risk_pred_final = risk_pred_from_disp.copy()
 
-    # softmax兼容实现
     def _softmax(x):
         e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
         return e_x / e_x.sum(axis=-1, keepdims=True)
 
     probs_logits = _softmax(risk_logits_avg)
 
-    # 对于位移路径给出的置信度较低的样本（接近阈值边界），用分类头修正
     for i in range(len(risk_pred_final)):
         cum_pred_i = pred_cum_combined[i]
-        # 计算到最近阈值的距离
         dists = [abs(cum_pred_i - t) for t in cfg.RISK_THRESHOLDS]
         min_dist = min(dists)
-        # 如果很接近阈值边界且分类头置信度高，信任分类头
         if min_dist < 2.0 and probs_logits[i].max() > 0.6:
             risk_pred_final[i] = risk_pred_from_logits[i]
 
     risk_pred = risk_pred_final
-    probs = probs_logits  # 用分类头的概率作为置信度
+    probs = probs_logits
 
     # 指标计算
     mae_dy = mean_absolute_error(dy_true.flatten(), dy_pred_avg.flatten())
@@ -961,9 +964,9 @@ def ensemble_predict(models, dataloader):
             'MAE_dy': float(round(mae_dy, 4)),
             'RMSE_dy': float(round(rmse_dy, 4)),
             'R2_dy': float(round(r2_dy, 4)),
-            'MAE_cum': float(round(mean_absolute_error(cum_true, aux_pred_avg[:, 0]), 4)),
-            'RMSE_cum': float(round(np.sqrt(mean_squared_error(cum_true, aux_pred_avg[:, 0])), 4)),
-            'R2_cum': float(round(r2_score(cum_true, aux_pred_avg[:, 0]), 4)),
+            'MAE_cum': float(round(mean_absolute_error(cum_true, pred_cum_combined), 4)),
+            'RMSE_cum': float(round(np.sqrt(mean_squared_error(cum_true, pred_cum_combined)), 4)),
+            'R2_cum': float(round(r2_score(cum_true, pred_cum_combined), 4)),
         },
         'risk': {
             'Accuracy': float(round(acc, 4)),
@@ -974,9 +977,9 @@ def ensemble_predict(models, dataloader):
     }
 
     results_df = pd.DataFrame({
-        'node': meta['nodes'],
-        'month': meta['months'],
-        'zone': meta['zones'],
+        'node': gt_nodes,
+        'month': gt_months,
+        'zone': gt_zones,
         'true_dy_h1': dy_true[:, 0],
         'pred_dy_h1': dy_pred_avg[:, 0],
         'true_dy_h2': dy_true[:, 1],
@@ -984,7 +987,7 @@ def ensemble_predict(models, dataloader):
         'true_dy_h3': dy_true[:, 2],
         'pred_dy_h3': dy_pred_avg[:, 2],
         'true_cum_dy_H': cum_true,
-        'pred_cum_dy_H': aux_pred_avg[:, 0],
+        'pred_cum_dy_H': pred_cum_combined,
         'true_label_future': [cfg.RISK_LABELS[int(r)] for r in risk_true],
         'pred_label_future': [cfg.RISK_LABELS[int(r)] for r in risk_pred],
         'confidence': [float(probs[i, int(risk_pred[i])]) for i in range(len(risk_pred))],
